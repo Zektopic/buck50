@@ -193,6 +193,7 @@ def check_version(quiet):
 
 
 def firmware_connect(quiet=False):
+    attempts = 0
     while True:
         if not os.isatty(usb_fd): break   # for testing
         if not quiet:
@@ -217,6 +218,12 @@ def firmware_connect(quiet=False):
         elif not os.isatty(usb_fd):   # for testing
             break
         else:
+            attempts += 1
+            if not interactive and attempts >= 5:
+                sys.stderr.write(  "No response from buck50 device on %s "
+                                   "after %d attempts\n"
+                                 % (dev_acm, attempts)                    )
+                sys.exit(1)
             sys.stderr.write("Will retry sending signature data in 1 second\n")
             time.sleep(1)
     if not os.isatty(usb_fd): return  # for testing
@@ -1128,7 +1135,7 @@ class Pager(object):
             else:                                        newline = '\n'
             self.__stream.write("%s%s" % (line, newline))
             line_num += 1
-            if line_num >= self.__term_h:
+            if line_num >= self.__term_h and interactive:
                 cooked = termios.tcgetattr(sys.stdin)
                 raw    = termios.tcgetattr(sys.stdin)
                 raw[3] = raw[3] & ~(    termios.ECHO
@@ -2127,7 +2134,64 @@ I2cDuty._help = "Duty cycle for I2C \"fast\" flavor (see "  \
 
 IDENTITY = 0xea017af5
 
-DEV_ACM = '/dev/ttyACM0'
+DEV_ACM = '/dev/ttyACM0'   # if none found by find_devices()
+
+# buck50 firmware's USB device descriptor (ST's generic "Virtual COM Port"
+#   ids, so other devices may have them too -- firmware_connect() is what
+#   actually confirms a buck50)
+USB_VENDOR_PRODUCT = ('0483', '5740')
+USB_PRODUCT_NAME   = "STM32 Virtual COM Port"
+
+def find_devices(sysfs='/sys/class/tty'):
+    """[(device file, USB serial number), ...] of CDC-ACM serial ports with
+    the buck50 firmware's USB ids, in /dev/ttyACM<n> numerical order"""
+    def attr(directory, name):
+        try:
+            with open(os.path.join(directory, name)) as file:
+                return file.read().strip()
+        except OSError:
+            return None
+    found = []
+    try:
+        names = os.listdir(sysfs)
+    except OSError:
+        return found
+    for name in names:
+        match = re.fullmatch(r'ttyACM(\d+)', name)
+        if not match:
+            continue
+        # .../ttyACMn/device is the USB interface, its parent the device
+        interface = os.path.realpath(os.path.join(sysfs, name, 'device'))
+        usb       = os.path.dirname(interface)
+        if (attr(usb, 'idVendor'), attr(usb, 'idProduct')) \
+           == USB_VENDOR_PRODUCT                           :
+            found.append((int(match.group(1)),
+                          '/dev/' + name     ,
+                          attr(usb, 'serial') or ''))
+    return [(path, serial) for (num, path, serial) in sorted(found)]
+
+
+
+def choose_device(acm_name, quiet, devices):
+    """Device file for commandline's acm_name (path, short name such as
+    "ACM1", or USB serial number), or the first of devices if None"""
+    if acm_name:
+        for (path, serial) in devices:
+            if serial and acm_name == serial:
+                return path
+        if   acm_name.startswith('/dev'): return              acm_name
+        elif acm_name.startswith( 'tty'): return '/dev/'    + acm_name
+        elif acm_name.startswith(   '.'): return              acm_name
+        else:                             return '/dev/tty' + acm_name
+    if not devices:
+        return DEV_ACM
+    if len(devices) > 1 and not quiet:
+        sys.stdout.write(  "Found %d possible buck50 devices: %s. Using %s "
+                           "(see --list to choose another)\n"
+                         % (len(devices),
+                            ', '.join(path for (path, serial) in devices),
+                            devices[0][0]))
+    return devices[0][0]
 TTY_MAX = 1024
 
 MAX_USB_BRIDGE = 62
@@ -2256,6 +2320,18 @@ SAFE_ASCII = [chr(n) if n in range(32,128) else '.' for n in range(256)]
 # globals
 usb_fd            = -1
 firmware_version  = None
+
+# Scripted operation (--command, --script, or commands piped to stdin):
+#   - nothing asks the user anything; r_u_sure() and "overwrite file?"
+#     are answered by assume_yes ("--yes")
+#   - stdin isn't watched for <ENTER> to abort waits (CTRL-C still works)
+#   - no paging of long output
+interactive       = True
+assume_yes        = False
+
+def keyboard():
+    """stdin in a tuple for select() if <ENTER> may abort, else empty"""
+    return (sys.stdin,) if interactive else ()
 
 
 
@@ -3257,6 +3333,10 @@ def decode_escape(byts):
 
 def r_u_sure(question):
     Pager()("%s (Y/n): " % question, immed=True, final=False, one_line=True)
+    if not interactive:
+        sys.stdout.write("%s (non-interactive%s)\n"
+                         % (('Y', '') if assume_yes else ('n', ', see --yes')))
+        return assume_yes
     sys.stdout.flush()
     try:
         answer = sys.stdin.readline()
@@ -3379,7 +3459,7 @@ def size_read(size, error=True):
 WAIT_READ_STDIN    = '<stdin>'
 def wait_read(size, timeout=None, error=True):
     try:
-        (readers, writers, exceptors) = select.select((usb_fd, sys.stdin),
+        (readers, writers, exceptors) = select.select((usb_fd,) + keyboard(),
                                                       (                 ),
                                                       (                 ),
                                                       timeout            )
@@ -3409,7 +3489,8 @@ def exact_read(size, timeout=None, error=True):
     remain = size
     while remain:
         try:
-            (readers, writers, exceptors) = select.select((usb_fd, sys.stdin),
+            (readers, writers, exceptors) = select.select((usb_fd,)
+                                                          + keyboard()      ,
                                                           (                 ),
                                                           (                 ),
                                                           timeout            )
@@ -3451,7 +3532,8 @@ def flush_read(wait_time):
     begin_time = time.time()
     while time.time() - begin_time < wait_time:
         try:
-            (readers, writers, exceptors) = select.select((usb_fd, sys.stdin),
+            (readers, writers, exceptors) = select.select((usb_fd,)
+                                                          + keyboard()      ,
                                                           (                 ),
                                                           (usb_fd,          ),
                                                           wait_time)
@@ -3514,11 +3596,17 @@ def safe_open(filename, message, mode='w'):
                in  os.path.basename(filename)
                for name in ('tmp', 'temp', 'scratch')):
             answer = 'Y'
+        elif not interactive:
+            answer = 'Y' if assume_yes else 'n'
+            sys.stdout.write(  "File \"%s\" exists: %s (non-interactive%s)\n"
+                             % (filename                               ,
+                                'overwriting' if assume_yes else 'keeping',
+                                '' if assume_yes else ', see --yes'      ))
         else:
             answer = safe_input(  "File \"%s\" exists: Overwrite (Y/n)? "
                                 % filename                               ,
                                 "safe_open"                              )
-        if answer[0] == 'Y':
+        if answer and answer[0] == 'Y':
             try:
                 os.unlink(filename)
             except Exception as error:
@@ -4248,7 +4336,7 @@ def upload_digital(samples   ,
                                 delt                      ,
                                 TimeVal.str(delt / CPU_HZ))  )
             linenumber += 1
-            if linenumber >= term_size - 4:
+            if linenumber >= term_size - 4 and interactive:
                 sys.stdout.write("<ENTER> to continue, "
                                  "any letter+<ENTER> to abort):  ")
                 sys.stdout.flush()
@@ -4600,7 +4688,7 @@ def upload_analog(samples     ,
         else:
             sys.stdout.write(text)
             linenumber += 1
-            if linenumber + extra_lines >= term_size - 1:
+            if linenumber + extra_lines >= term_size - 1 and interactive:
                 sys.stdout.write("<ENTER> to continue, any letter to abort):  ")
                 sys.stdout.flush()
                 if sys.stdin.readline()[0] not in " \n":
@@ -6886,17 +6974,20 @@ def pre_input_hook():
 #
 #
 
-def main(quiet, acm_name, no_auto_viewer, load_file, halt):
+def main(quiet, acm_name, no_auto_viewer, load_file, halt, script=None,
+         keep_going=False):
+    """script: None for interactive use, else list of (source, command)"""
+    global dev_acm, usb_fd, interactive
+
+    if script is not None:
+        interactive = False
+        # count error messages, to stop script and set exit status
+        sys.stderr = ErrorCounter(sys.stderr)
+
     if not quiet:
         sys.stdout.write(BANNER)
 
-    global dev_acm, usb_fd
-
-    if acm_name:
-        if   acm_name.startswith('/dev'): dev_acm =              acm_name
-        elif acm_name.startswith( 'tty'): dev_acm = '/dev/'    + acm_name
-        elif acm_name.startswith(   '.'): dev_acm =              acm_name
-        else:                             dev_acm = '/dev/tty' + acm_name
+    dev_acm = choose_device(acm_name, quiet, find_devices())
 
     usb_connect()
 
@@ -6922,14 +7013,24 @@ def main(quiet, acm_name, no_auto_viewer, load_file, halt):
     data_history = []
 
     empty_line_helped = False
+    failed            = 0
     while True:
-        user_input = safe_input("$1.50: "                        ,
-                                "main"                           ,
-                                "Use \"quit\" (or \"q\") to exit")
-        completer.flush_cache()  # so doesn't complete with old if same input
+        if script is not None:
+            if not script:
+                sys.exit(1 if failed else 0)
+            (source, user_input) = script.pop(0)
+            errors_before        = sys.stderr.count
+            if user_input.strip():
+                sys.stdout.write("$1.50: %s\n" % user_input)
+                sys.stdout.flush()
+        else:
+            user_input = safe_input("$1.50: "                        ,
+                                    "main"                           ,
+                                    "Use \"quit\" (or \"q\") to exit")
+            completer.flush_cache()  # so doesn't complete with old if same
 
-        if user_input is None and not sys.stdin.isatty():
-            sys.exit(0)   # end of redirected input, would otherwise loop
+        if not user_input and script is not None:
+            continue
 
         if not user_input:
             if not empty_line_helped:
@@ -6974,6 +7075,15 @@ def main(quiet, acm_name, no_auto_viewer, load_file, halt):
 
             COMMANDS[cmd].func(COMMANDS[cmd].code, user_input, fields[1:])
 
+            if script is not None and sys.stderr.count > errors_before:
+                failed += 1
+                if not keep_going:
+                    sys.stderr.write(  "Stopping: error in %s (use "
+                                       "--keep-going to continue after "
+                                       "errors)\n"
+                                     % source                          )
+                    sys.exit(1)
+
             data_hist_len = readline.get_current_history_length()
             for ndx in range(len(data_history) + 1, data_hist_len + 1):
                 data_history.append(readline.get_history_item(ndx))
@@ -6983,6 +7093,50 @@ def main(quiet, acm_name, no_auto_viewer, load_file, halt):
         else:
             Pager(stream=sys.stderr)('%s\n' % disambig.error,
                                      immed=True, final=False)
+            if script is not None:
+                failed += 1
+                if not keep_going:
+                    sys.stderr.write("Stopping: error in %s\n" % source)
+                    sys.exit(1)
+
+
+
+class ErrorCounter(object):
+    """stderr wrapper counting non-blank writes. In scripted operation a
+    command that writes to stderr is taken to have failed."""
+    def __init__(self, stream):
+        self.stream = stream
+        self.count  = 0
+    def write(self, text):
+        if text.strip():
+            self.count += 1
+        return self.stream.write(text)
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+
+def read_script(commands, script_file):
+    """[(source, command), ...] from --command list and --script file
+    ("-" for stdin), in that order"""
+    script = [("--command #%d" % (num + 1), command)
+              for (num, command) in enumerate(commands or [])]
+    if script_file:
+        try:
+            if script_file == '-':
+                lines = sys.stdin.read().splitlines()
+                name  = '<stdin>'
+            else:
+                with open(script_file) as file:
+                    lines = file.read().splitlines()
+                name = script_file
+        except (OSError, UnicodeDecodeError) as error:
+            sys.stderr.write(  "Can't read script %s: %s\n"
+                             % (script_file, error)       )
+            sys.exit(1)
+        script += [("%s line %d" % (name, num + 1), line)
+                   for (num, line) in enumerate(lines)]
+    return script
 
 
 
@@ -7031,11 +7185,44 @@ def parse_commandline():
                              "reset and/or power cycle, and USB re-enumeration "
                              "required."                                      )
 
+    parser.add_argument('-l', '--list',
+                        action="store_true",
+                        help="List connected devices with buck50's USB ids "
+                             "(and their serial numbers) and exit")
+
+    parser.add_argument('-c', '--command',
+                        action='append',
+                        metavar='COMMAND',
+                        help="Run COMMAND (e.g. \"logic edges=100\") "
+                             "instead of prompting; may be repeated. "
+                             "Exits when done: status 1 if a command "
+                             "reported an error")
+
+    parser.add_argument('-s', '--script',
+                        metavar='FILE',
+                        help="Run commands from FILE, one per line, "
+                             "\"#\" comments (\"-\" for stdin; commands "
+                             "piped to stdin are run this way anyway). "
+                             "After any --command(s). Exit as --command")
+
+    parser.add_argument('-y', '--yes',
+                        action="store_true",
+                        help="With --command/--script: answer \"Y\" to "
+                             "questions, e.g. overwriting an existing file "
+                             "(default \"n\")")
+
+    parser.add_argument('-k', '--keep-going',
+                        action="store_true",
+                        help="With --command/--script: continue after a "
+                             "command reports an error")
+
     parser.add_argument("acm",
                         nargs='?',
-                        default=DEV_ACM,
-                        help="CDC/ACM device (with or without \"/dev\" or "
-                             "\"/dev/tty\" prefix)")
+                        default=argparse.SUPPRESS,  # no "(default: None)"
+                        help="CDC/ACM device, with or without \"/dev\" or "
+                             "\"/dev/tty\" prefix, or a device's USB serial "
+                             "number (see --list). Default: first device "
+                             "with buck50's USB ids, else %s" % DEV_ACM)
 
     return parser.parse_args()
 
@@ -7048,4 +7235,23 @@ if __name__ == '__main__':
         sys.stdout.write("%s\n" % COPYRIGHT)
         sys.exit(0)
 
-    main(args.quiet, args.acm, args.no_auto_viewer, args.file, args.halt)
+    if args.list:
+        devices = find_devices()
+        for (path, serial) in devices:
+            sys.stdout.write("%s  %s\n" % (path, serial or "<no serial>"))
+        if not devices:
+            sys.stderr.write(  "No devices with buck50's USB ids (%s:%s)\n"
+                             % USB_VENDOR_PRODUCT                         )
+        sys.exit(0 if devices else 1)
+
+    script = None
+    if args.command or args.script or not sys.stdin.isatty():
+        script = read_script(args.command,
+                             args.script or (    None
+                                             if  sys.stdin.isatty()
+                                             or  args.command
+                                             else '-'           ))
+    assume_yes = args.yes
+
+    main(args.quiet, getattr(args, 'acm', None), args.no_auto_viewer,
+         args.file, args.halt, script, args.keep_going)
