@@ -1,0 +1,4 @@
+pytest
+# test_firmware.py only (skipped if missing):
+pyelftools
+unicorn>=2.0
