@@ -17,11 +17,13 @@
 # (LICENSE.txt) along with the buck50 program.  If not, see
 # <https:#www.gnu.org/licenses/gpl.html>
 
-ifndef GCC_ARM_ROOT
-$(error set GCC_ARM_ROOT environment variable)
-endif
-
+# Toolchain: $(GCC_ARM_ROOT)/bin if GCC_ARM_ROOT is set, else whatever
+# arm-none-eabi-* is on PATH. The committed buck50.{bin,hex,elf} are built
+# with GNU Arm Embedded Toolchain 9-2020-q2-update (see ../Dockerfile);
+# other versions will produce different, untested, binaries.
+ifdef GCC_ARM_ROOT
 export PATH := $(GCC_ARM_ROOT)/bin:$(PATH)
+endif
 
 CC      = arm-none-eabi-gcc
 CXX     = arm-none-eabi-g++
@@ -76,6 +78,14 @@ EXTRA_CXX_FLAGS = -DUSB_DEV_FLASH_WAIT_STATES=$(FLASH)	\
 
 WARNINGS_FLAGS ?= -Wall -Wextra
 DEBUG_FLAG     ?= -g3
+# debug info (buck50.elf only, not .bin/.hex) independent of where the
+# source tree and toolchain happen to be installed
+PREFIX_MAPS     = $(CURDIR)=.
+ifdef GCC_ARM_ROOT
+PREFIX_MAPS    += $(abspath $(GCC_ARM_ROOT))=/gcc-arm-none-eabi
+endif
+DEBUG_FLAG     += $(addprefix -fdebug-prefix-map=,$(PREFIX_MAPS))
+AS_DEBUG_FLAG   = -g3 $(addprefix --debug-prefix-map ,$(PREFIX_MAPS))
 OPTIMIZE_FLAG  ?= -O2
 STD_CXX_FLAG   ?= -std=c++17
 INIT_DEFINES   ?= -DWEAK_FUNCTIONS
@@ -124,7 +134,7 @@ LDOPTS  	= $(LINK_FLAGS)
 	$(CC) -c $(CCOPTS) $< -o $@
 
 %.o: %.s
-	$(AS) $(DEBUG_FLAG) $(AS_ARM_FLAGS) $< -o $@
+	$(AS) $(AS_DEBUG_FLAG) $(AS_ARM_FLAGS) $< -o $@
 
 buck50.o: 		src/buck50.cxx
 buck50_asm.o: 		src/buck50_asm.s

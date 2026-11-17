@@ -637,7 +637,8 @@ sample_func .req    r12
 .equ    SPEED_IRREGULAR ,   1
 .equ    SPEED_UNIFORM   ,   2
 .equ    SPEED_MHZ_4     ,   3
-.equ    SPEED_CODE_LIMIT,   3
+.equ    SPEED_EDGE      ,   4
+.equ    SPEED_CODE_LIMIT,   4
 
 #endif  // .reqs and .equs
 
@@ -953,6 +954,13 @@ cmp     valu,       SPEED_MHZ_4             // if (valu == SPEED_MHZ_4) {
 itttt   eq
 movweq  flash_beg,  :lower16:mhz_4          //    flash_beg = mhz_4
 movteq  flash_beg,  :upper16:mhz_4          //        "     =   "
+movweq  flash_end,  :lower16:edge           //    flash_end = edge
+movteq  flash_end,  :upper16:edge           //        "     =  "       }
+
+cmp     valu,       SPEED_EDGE              // if (valu == SPEED_EDGE) {
+itttt   eq
+movweq  flash_beg,  :lower16:edge           //    flash_beg = edge
+movteq  flash_beg,  :upper16:edge           //        "     =  "
 movweq  flash_end,  :lower16:sampling_end   //    flash_end = <end>
 movteq  flash_end,  :upper16:sampling_end   //        "     =   "      }
 
@@ -972,7 +980,13 @@ mov     pc,         lr_save                 // return
 // triggering
 //
 
-.balign 4
+// Same position relative to 8/16-byte boundaries as in the 0.9.2 binary
+// (12 mod 16) regardless of the size of the code before it, so trigger
+// loop timing doesn't shift when unrelated code changes.
+.balign 16
+.rept   6
+nop
+.endr
 .thumb_func
 .global trigger_and_sample_ganged
 trigger_and_sample_ganged:
@@ -1007,7 +1021,13 @@ ganged_trig_end:
 mov     pc, sample_func
 
 
-.balign 4
+// Same position relative to 8/16-byte boundaries as in the 0.9.2 binary
+// (12 mod 16) regardless of the size of the code before it, so trigger
+// loop timing doesn't shift when unrelated code changes.
+.balign 16
+.rept   6
+nop
+.endr
 .thumb_func
 .global trigger_and_sample_plain
 trigger_and_sample_plain:
@@ -1087,7 +1107,14 @@ strne       idrtim, [sample], #4            // *sample++ = idrtim; }
 
 
 
-.balign     4
+// Pin the loops to the same position relative to 8/16-byte boundaries
+// (flash prefetch blocks are 8 bytes) as in the 0.9.2 binary their cycle
+// counts were measured on (mhz_6 at 12 mod 16), instead of wherever the
+// preceding code's size happens to leave them.
+.balign     16
+.rept       6
+nop
+.endr
 sampling:
 
 // all loop until memory/timer/usb IRQ
@@ -1120,6 +1147,86 @@ nop     // flash=16, ram=19 with just 1 nop
 nop     // flash=??, ram=19 with      2 nops
 nop     // flash=18, ram=21 with      3 nops
 b   mhz_4
+
+
+// "edge" mode: poll fast while nothing changes, pay for the timestamp and
+// store only when something does.
+//
+// The modes above spend the same 11 cycles on every poll because each one
+// reads systick and builds the sample word whether or not it is stored.
+// Here the idle path is only  ldr/cmp/bne(not taken)  and a level change
+// branches out of line to a per-site stub which reads systick, stores, and
+// branches back to the following poll.  Registers ping-pong as in
+// mhz_6/irregular so no "mov prev,crnt" is needed.
+//
+// Trade-off: polls are much closer together while the lines are quiet
+// (finer edge timestamps, shorter pulses seen), but the first poll after a
+// stored change is later than in the modes above (stub plus two taken
+// branches), so sustained back-to-back edges are captured more slowly.
+//
+// systick is read in the stub, i.e. a constant few cycles later after the
+// gpiob read than in the modes above.  The offset is the same for every
+// stored sample so it cancels in the host's sample-to-sample deltas (except
+// against the two initial samples stored by trigger_tail/sampling_setup).
+//
+// Cycle counts are NOT measured on hardware.  Costing instructions so that
+// the modes above come out at their measured flash numbers (ldr gpiob 4-5,
+// cmp 1, bne-not-taken 1, taken branch 3, ldr systick 2-3, orr 1, str 2)
+// gives:  idle poll 6-7, extra 3 at the loop-closing branch, and 17 from
+// the poll which sees a change to the next poll.
+
+.macro edge_poll_crnt   site
+ldr         crnt, [gpiob, IDR]              // crnt = gpiob->idr
+cmp         crnt, prev                      // if (crnt != prev)
+bne         edge_store_&site                //     goto edge_store_<site>
+edge_resume_&site:
+.endm
+
+.macro edge_poll_prev   site
+ldr         prev, [gpiob, IDR]              // prev = gpiob->idr
+cmp         prev, crnt                      // if (prev != crnt)
+bne         edge_store_&site                //     goto edge_store_<site>
+edge_resume_&site:
+.endm
+
+.macro edge_store_crnt  site, resume
+edge_store_&site:
+ldr         idrtim, [systick, VAL]          // idrtim = systick->val
+orr         idrtim, idrtim, crnt, lsl #20   // idrtim |= (crnt << 20);
+str         idrtim, [sample], #4            // *sample++ = idrtim;
+b           resume                          // back to poll after <site>
+.endm
+
+.macro edge_store_prev  site, resume
+edge_store_&site:
+ldr         idrtim, [systick, VAL]          // idrtim = systick->val
+orr         idrtim, idrtim, prev, lsl #20   // idrtim |= (prev << 20);
+str         idrtim, [sample], #4            // *sample++ = idrtim;
+b           resume                          // back to poll after <site>
+.endm
+
+.balign     8
+edge:           // estimated, see above: flash=6,6,6,6,6,6,6,9 (or 7,..,10)
+edge_poll_crnt  0
+edge_poll_prev  1
+edge_poll_crnt  2
+edge_poll_prev  3
+edge_poll_crnt  4
+edge_poll_prev  5
+edge_poll_crnt  6
+edge_poll_prev  7
+b   edge
+
+// all 12 bytes each, so stay 4-byte aligned
+.balign     4
+edge_store_crnt 0, edge_resume_0
+edge_store_prev 1, edge_resume_1
+edge_store_crnt 2, edge_resume_2
+edge_store_prev 3, edge_resume_3
+edge_store_crnt 4, edge_resume_4
+edge_store_prev 5, edge_resume_5
+edge_store_crnt 6, edge_resume_6
+edge_store_prev 7, edge             // not edge_resume_7, is only "b edge"
 
 .balign 4
 sampling_end:
