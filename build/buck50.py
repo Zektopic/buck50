@@ -42,13 +42,19 @@ import sys
 import termios
 import time
 import tty
+import zipfile
 
 
 ### copyright and version
 #
 #
 
-VERSION = (0, 9, 6)
+VERSION = (0, 9, 7)
+
+# firmware this buck50.py was released with, and oldest firmware having
+#   features that were added after the 0.9.2 firmware
+FIRMWARE_VERSION  = (0, 9, 3)
+EDGE_MODE_VERSION = (0, 9, 3)
 
 COPYRIGHT = '''%s %d.%d.%d
 Copyright 2020 Mark R. Rubin aka "thanks4opensource"''' \
@@ -164,26 +170,30 @@ def check_version(quiet):
     vers_rsp = cmd_rsp(VERS_CMD, 3, "VERS")
     if vers_rsp is not None:
         firmware_version = struct.unpack('BBB', vers_rsp)
-        if firmware_version == VERSION:
+        firmware = '.'.join([str(elem) for elem in firmware_version])
+        expected = '.'.join([str(elem) for elem in FIRMWARE_VERSION])
+        if firmware_version == FIRMWARE_VERSION:
             if not quiet:
-                sys.stdout.write(  "Firmware version  match: %s\n"
-                                 % '.'.join([str(elem) for elem in VERSION]))
+                sys.stdout.write("Firmware version  match: %s\n" % firmware)
+        elif firmware_version[:2] != FIRMWARE_VERSION[:2]:
+            sys.stdout.write(  "ERROR: Firmware version mismatch: "
+                               "firmware: %s  expected: %s\n"
+                             % (firmware, expected)                 )
+        elif firmware_version < FIRMWARE_VERSION:
+            if not quiet:
+                sys.stdout.write(  "Firmware version %s is older than %s: "
+                                   "works, except newer features (see "
+                                   "RELEASE_NOTES.txt) are unavailable\n"
+                                 % (firmware, expected)                    )
         else:
-            if    firmware_version[0] != VERSION[0]\
-               or firmware_version[1]  < VERSION[1]:
-                mismatch = "ERROR"
-            else:
-                mismatch = "Warning"
-            sys.stdout.write(  "%s: Firmware version mismatch: "
-                               "firmware: %s  software: %s\n"
-                             % (mismatch,
-                                '.'.join([str(elem) for elem in
-                                                    firmware_version]  ),
-                                '.'.join([str(elem) for elem in VERSION])))
+            sys.stdout.write(  "Warning: Firmware version %s is newer than "
+                               "%s which this buck50.py was released with\n"
+                             % (firmware, expected)                         )
 
 
 
 def firmware_connect(quiet=False):
+    attempts = 0
     while True:
         if not os.isatty(usb_fd): break   # for testing
         if not quiet:
@@ -208,6 +218,12 @@ def firmware_connect(quiet=False):
         elif not os.isatty(usb_fd):   # for testing
             break
         else:
+            attempts += 1
+            if not interactive and attempts >= 5:
+                sys.stderr.write(  "No response from buck50 device on %s "
+                                   "after %d attempts\n"
+                                 % (dev_acm, attempts)                    )
+                sys.exit(1)
             sys.stderr.write("Will retry sending signature data in 1 second\n")
             time.sleep(1)
     if not os.isatty(usb_fd): return  # for testing
@@ -1119,7 +1135,7 @@ class Pager(object):
             else:                                        newline = '\n'
             self.__stream.write("%s%s" % (line, newline))
             line_num += 1
-            if line_num >= self.__term_h:
+            if line_num >= self.__term_h and interactive:
                 cooked = termios.tcgetattr(sys.stdin)
                 raw    = termios.tcgetattr(sys.stdin)
                 raw[3] = raw[3] & ~(    termios.ECHO
@@ -1290,7 +1306,7 @@ class Text(object):
                   immed=True, one_line=True                            )
     def suitable(self):
         return   "<any string <= %d chars including "   \
-                 "optional \C character, " \
+                 "optional \\C character, " \
                  "\\xMN hexadecimal, \\ABC octal, "     \
                  "and/ or \\uABCD unicode escapes) "    \
                  "(use \"\\x20\" or \"\\040\" for "     \
@@ -1464,7 +1480,7 @@ class Printf(object):
                  "by valid printf format character. May contain "   \
                  "arbitrary additional text before and/or after "   \
                  "printf format, including optional escape "        \
-                 "sequences in the form \C character, " \
+                 "sequences in the form \\C character, " \
                  "\\xMN hexadecimal, \\ABC octal, "     \
                  "and/ or \\uABCD unicode escapes) "    \
                  "(use \"\\x20\" or \"\\040\" for "     \
@@ -1723,12 +1739,14 @@ class SamplingMode(StringsAndValues):
     IRREGULAR =  1
     UNIFORM   =  2
     MHZ_4     =  3
+    EDGE      =  4  # needs firmware EDGE_MODE_VERSION or later
     ANALOG    = 15  # only for upld_cmd, not valid for `logic mode=`
     strings_and_values = {
         '6.26MHz'   :  MHZ_6_26 ,
         'irregular' :  IRREGULAR,
         'uniform'   :  UNIFORM  ,
         '4MHz'      :  MHZ_4    ,
+        'edge'      :  EDGE     ,
     }
     def __init__(self, init='4MHz-avg'): super().__init__(init)
 SAMPLING_MODE_INVERSE = {     val:key
@@ -1930,8 +1948,12 @@ class DigitalFormat(StringsAndValues):
 
 class AnalogFormat(StringsAndValues):
     CSV = 1
+    VCD = 2     # "real" variables: gtkwave
+    SR  = 3     # sigrok session file: pulseview, sigrok-cli
     strings_and_values = {
         'csv' : CSV,
+        'vcd' : VCD,
+        'sr'  : SR ,
     }
     def __init__(self, init='vcd'): super().__init__(init)
 
@@ -2112,7 +2134,64 @@ I2cDuty._help = "Duty cycle for I2C \"fast\" flavor (see "  \
 
 IDENTITY = 0xea017af5
 
-DEV_ACM = '/dev/ttyACM0'
+DEV_ACM = '/dev/ttyACM0'   # if none found by find_devices()
+
+# buck50 firmware's USB device descriptor (ST's generic "Virtual COM Port"
+#   ids, so other devices may have them too -- firmware_connect() is what
+#   actually confirms a buck50)
+USB_VENDOR_PRODUCT = ('0483', '5740')
+USB_PRODUCT_NAME   = "STM32 Virtual COM Port"
+
+def find_devices(sysfs='/sys/class/tty'):
+    """[(device file, USB serial number), ...] of CDC-ACM serial ports with
+    the buck50 firmware's USB ids, in /dev/ttyACM<n> numerical order"""
+    def attr(directory, name):
+        try:
+            with open(os.path.join(directory, name)) as file:
+                return file.read().strip()
+        except OSError:
+            return None
+    found = []
+    try:
+        names = os.listdir(sysfs)
+    except OSError:
+        return found
+    for name in names:
+        match = re.fullmatch(r'ttyACM(\d+)', name)
+        if not match:
+            continue
+        # .../ttyACMn/device is the USB interface, its parent the device
+        interface = os.path.realpath(os.path.join(sysfs, name, 'device'))
+        usb       = os.path.dirname(interface)
+        if (attr(usb, 'idVendor'), attr(usb, 'idProduct')) \
+           == USB_VENDOR_PRODUCT                           :
+            found.append((int(match.group(1)),
+                          '/dev/' + name     ,
+                          attr(usb, 'serial') or ''))
+    return [(path, serial) for (num, path, serial) in sorted(found)]
+
+
+
+def choose_device(acm_name, quiet, devices):
+    """Device file for commandline's acm_name (path, short name such as
+    "ACM1", or USB serial number), or the first of devices if None"""
+    if acm_name:
+        for (path, serial) in devices:
+            if serial and acm_name == serial:
+                return path
+        if   acm_name.startswith('/dev'): return              acm_name
+        elif acm_name.startswith( 'tty'): return '/dev/'    + acm_name
+        elif acm_name.startswith(   '.'): return              acm_name
+        else:                             return '/dev/tty' + acm_name
+    if not devices:
+        return DEV_ACM
+    if len(devices) > 1 and not quiet:
+        sys.stdout.write(  "Found %d possible buck50 devices: %s. Using %s "
+                           "(see --list to choose another)\n"
+                         % (len(devices),
+                            ', '.join(path for (path, serial) in devices),
+                            devices[0][0]))
+    return devices[0][0]
 TTY_MAX = 1024
 
 MAX_USB_BRIDGE = 62
@@ -2242,6 +2321,18 @@ SAFE_ASCII = [chr(n) if n in range(32,128) else '.' for n in range(256)]
 usb_fd            = -1
 firmware_version  = None
 
+# Scripted operation (--command, --script, or commands piped to stdin):
+#   - nothing asks the user anything; r_u_sure() and "overwrite file?"
+#     are answered by assume_yes ("--yes")
+#   - stdin isn't watched for <ENTER> to abort waits (CTRL-C still works)
+#   - no paging of long output
+interactive       = True
+assume_yes        = False
+
+def keyboard():
+    """stdin in a tuple for select() if <ENTER> may abort, else empty"""
+    return (sys.stdin,) if interactive else ()
+
 
 
 # configurations/settings
@@ -2330,10 +2421,19 @@ Sampling mode
     uniform     : constant           15  "    "      "    (72  /15 = 4.80MHz)
     4MHz        : constant           18  "    "      "    (72  /18 = 4.00MHz)
   - if "code-mem=ram":
-    6.26MHz     : sequence    5@13+1@17 CPU clocks/sample (72*6/69 = 5.27MHz)
+    6.26MHz     : sequence    5@13+1@17 CPU clocks/sample (72*6/82 = 5.27MHz)
     irregular   : alternating   13 + 17  "    "      "    (72*2/30 = 4.80MHz)
     uniform     : constant           17  "    "      "    (72  /17 = 4.24MHz)
-    4MHz        : constant           18  "    "      "    (72  /18 = 3.43MHz)
+    4MHz        : constant           21  "    "      "    (72  /21 = 3.43MHz)
+  - "edge" (EXPERIMENTAL, needs firmware 0.9.3 or later):
+    edge        : c. 6-7 CPU clocks/poll while inputs quiet (c. 10-11MHz)
+                  c. 17 from stored change to next poll     (c. 4.2MHz)
+    . each poll only checks inputs for change; time is read
+      and sample stored, out of line, only when one is seen
+    . compared to modes above: finer timing of isolated edges
+      and shorter pulses seen, but slower for back-to-back edges
+    . counts ESTIMATED from the other modes' measured instruction
+      timings, NOT measured on hardware
 """
 digital_config['duration']._help = "Sampling time limit"
 digital_config['edges'   ]._help = "Maximum number of digital samples "     \
@@ -2419,7 +2519,14 @@ upload_config['count'         ]._help = "Number of samples to upload, "       \
                                         "starting with \"begin=\""
 upload_config['file'          ]._help = "File to write samples to"
 upload_config['digital-frmt'  ]._help = "Digital dump file format"
-upload_config['analog-frmt'   ]._help = "Analog dump file format"
+upload_config['analog-frmt'   ]._help = "Analog dump file format. \"csv\" "  \
+                                        "for gnuplot (and spreadsheets, "     \
+                                        "etc), \"sr\" (sigrok session) for "  \
+                                        "pulseview and sigrok-cli, \"vcd\" "  \
+                                        "(real-valued signals) for gtkwave. " \
+                                        "\"sr\" and \"vcd\" are launched "     \
+                                        "using \"viewer-vcd=\", \"csv\" "      \
+                                        "using \"viewer-csv=\"."
 upload_config['actives'       ]._help = "List of \"logic\" ports to dump "    \
                                         "to file (does not affect "           \
                                         "terminal or \"oscope\" output)"
@@ -2441,7 +2548,8 @@ upload_config['output'        ]._help = "Dump output destination"
 upload_config['viewer-csv'    ]._help = "External viewer program for CSV "    \
                                         "files"
 upload_config['viewer-vcd'    ]._help = "External viewer program for VCD "    \
-                                        "files"
+                                        "files, and for sigrok session "      \
+                                        "(\"analog-frmt=sr\") files"
 upload_config['other-csv'     ]._help = "External viewer program for CSV "    \
                                         "files when \"viewer-vcd=other\". "   \
                                         "May contain \"%s\" character for "   \
@@ -3225,6 +3333,10 @@ def decode_escape(byts):
 
 def r_u_sure(question):
     Pager()("%s (Y/n): " % question, immed=True, final=False, one_line=True)
+    if not interactive:
+        sys.stdout.write("%s (non-interactive%s)\n"
+                         % (('Y', '') if assume_yes else ('n', ', see --yes')))
+        return assume_yes
     sys.stdout.flush()
     try:
         answer = sys.stdin.readline()
@@ -3347,7 +3459,7 @@ def size_read(size, error=True):
 WAIT_READ_STDIN    = '<stdin>'
 def wait_read(size, timeout=None, error=True):
     try:
-        (readers, writers, exceptors) = select.select((usb_fd, sys.stdin),
+        (readers, writers, exceptors) = select.select((usb_fd,) + keyboard(),
                                                       (                 ),
                                                       (                 ),
                                                       timeout            )
@@ -3369,6 +3481,50 @@ def wait_read(size, timeout=None, error=True):
 
 
 
+def exact_read(size, timeout=None, error=True):
+    """Read exactly size bytes however the tty layer chunks them. Returns
+    (data, None) if all read, else (partial data, WAIT_READ_STDIN or None)
+    for user input or timeout/failure respectively"""
+    chunks = []
+    remain = size
+    while remain:
+        try:
+            (readers, writers, exceptors) = select.select((usb_fd,)
+                                                          + keyboard()      ,
+                                                          (                 ),
+                                                          (                 ),
+                                                          timeout            )
+        except KeyboardInterrupt:
+            return (b''.join(chunks), WAIT_READ_STDIN)
+        if usb_fd in readers:
+            try:
+                data = os.read(usb_fd, remain)
+            except OSError as os_error:
+                data = b''
+                if error:
+                    sys.stderr.write(  "Error reading from USB CDC-ACM "
+                                       "pipe: %s\n"
+                                     % os_error                         )
+            if not data:
+                return (b''.join(chunks), None)
+            chunks.append(data)
+            remain -= len(data)
+        elif sys.stdin in readers:
+            sys.stdin.readline()  # throw away input
+            return (b''.join(chunks), WAIT_READ_STDIN)
+        else:
+            if error:
+                sys.stderr.write(  "Timeout waiting %s second%s for %d of %d "
+                                   "bytes from USB CDC-ACM pipe\n"
+                                 % (timeout                    ,
+                                    '' if timeout == 1 else 's',
+                                    remain                     ,
+                                    size                       )            )
+            return (b''.join(chunks), None)
+    return (b''.join(chunks), None)
+
+
+
 def flush_read(wait_time):
     sys.stdout.write(  "flushing USB CDC-ACM pipe for %g second%s "
                        "(<ENTER> to abort) ...\n"
@@ -3376,7 +3532,8 @@ def flush_read(wait_time):
     begin_time = time.time()
     while time.time() - begin_time < wait_time:
         try:
-            (readers, writers, exceptors) = select.select((usb_fd, sys.stdin),
+            (readers, writers, exceptors) = select.select((usb_fd,)
+                                                          + keyboard()      ,
                                                           (                 ),
                                                           (usb_fd,          ),
                                                           wait_time)
@@ -3439,11 +3596,17 @@ def safe_open(filename, message, mode='w'):
                in  os.path.basename(filename)
                for name in ('tmp', 'temp', 'scratch')):
             answer = 'Y'
+        elif not interactive:
+            answer = 'Y' if assume_yes else 'n'
+            sys.stdout.write(  "File \"%s\" exists: %s (non-interactive%s)\n"
+                             % (filename                               ,
+                                'overwriting' if assume_yes else 'keeping',
+                                '' if assume_yes else ', see --yes'      ))
         else:
             answer = safe_input(  "File \"%s\" exists: Overwrite (Y/n)? "
                                 % filename                               ,
                                 "safe_open"                              )
-        if answer[0] == 'Y':
+        if answer and answer[0] == 'Y':
             try:
                 os.unlink(filename)
             except Exception as error:
@@ -3484,18 +3647,23 @@ def set_viewers(quiet):
     if pulseview:
         upload_config['output'      ].val = 'file'
         upload_config['digital-frmt'].val = 'vcd'
+        upload_config['analog-frmt' ].val = 'sr'
         upload_config['viewer-vcd'  ].val = 'pulseview'
         upload_config['auto-digital'].val = 'enabled'
+        upload_config['auto-analog' ].val = 'enabled'
         report += "Found %s" % pulseview
     elif gtkwave:
         upload_config['output'      ].val = 'file'
         upload_config['digital-frmt'].val = 'vcd'
+        upload_config['analog-frmt' ].val = 'vcd'
         upload_config['viewer-vcd'  ].val = 'gtkwave'
         upload_config['auto-digital'].val = 'enabled'
+        upload_config['auto-analog' ].val = 'enabled'
         report += "Found %s" % gtkwave
     if gnuplot:  # override VCD viewer because gnuplot faster and better exit
         upload_config['output'      ].val = 'file'
         upload_config['digital-frmt'].val = 'csv'
+        upload_config['analog-frmt' ].val = 'csv'
         upload_config['viewer-csv'  ].val = 'gnuplot'
         upload_config['auto-digital'].val = 'enabled'
         upload_config['auto-analog' ].val = 'enabled'
@@ -3520,12 +3688,14 @@ def set_viewers(quiet):
                            " auto-digital=%s"
                            " auto-analog=%s"
                            " digital-frmt=%s"
+                           " analog-frmt=%s"
                            " viewer-csv=%s"
                            " viewer-vcd=%s\n"
                          % (upload_config['output'      ],
                             upload_config['auto-digital'],
                             upload_config['auto-analog' ],
                             upload_config['digital-frmt'],
+                            upload_config['analog-frmt' ],
                             upload_config['viewer-csv'  ],
                             upload_config['viewer-vcd'  ]))
 
@@ -4071,9 +4241,18 @@ def upload_digital(samples   ,
         active_chans = upload_config['actives'].val
         active_ndxs  = [chan - 4 for chan in active_chans]  # chans are 4...11
         if save_as == DigitalFormat.VCD:
+            # VCD standard only allows timescale of 1, 10, or 100 units.
+            # pulseview/sigrok accept any (and need a coarse one to limit
+            #   memory use, see "help dump warn-pulseview="), gtkwave
+            #   itself does too but its vcd2fst etc. converters silently
+            #   treat others as 1, so for gtkwave multiply times instead
+            vcd_mult = 1
+            if     upload_config['viewer-vcd'].val == Viewer.GTKWAVE \
+               and upload_config['per-tick'  ].val not in (1, 10, 100):
+                vcd_mult = upload_config['per-tick'].val
             file.write(  "$timescale %d %s $end\n"
-                       % (upload_config['per-tick'  ].val  ,
-                          upload_config['tick-units'].str()))
+                       % (upload_config['per-tick'  ].val // vcd_mult,
+                          upload_config['tick-units'].str()          ))
             file.write("$scope module top $end\n")
             file.write("$var wire 1 z blk $end\n")
             for (ndx, chan) in zip(active_ndxs, active_chans):
@@ -4100,10 +4279,11 @@ def upload_digital(samples   ,
         linenumber  = 0
         upload_digital_header(first, count, total, max_memory, mode)
 
-    prev = None
-    tick = 0
-    tcks = 0
-    last = 0x00
+    prev      = None
+    prev_bits = None
+    tick      = 0
+    tcks      = 0
+    last      = 0x00
     for ndx in range(count):
         data = samples[ndx]
         tick = data  & 0xffffff
@@ -4120,18 +4300,28 @@ def upload_digital(samples   ,
             if save_as == DigitalFormat.VCD:
                 timval = 0
                 chng   = bits ^ last
+                if prev_bits is None:
+                    # first sample: give every signal its initial value,
+                    #   else viewers (gtkwave) show ones which never
+                    #   change, or haven't yet, as undefined
+                    chng = 0xff
                 if chng:
                     timval =    tcks   * upload_config['tick-units'].val \
                              / (CPU_HZ * upload_config['per-tick'  ].val)
-                    file.write('#%d\n' % int(round(timval)))
+                    file.write('#%d\n' % (int(round(timval)) * vcd_mult))
+                    if prev_bits is None:
+                        file.write("0z\n")
                     for ndx in active_ndxs:
                         bit = 1 << ndx
                         if chng & bit:
                             if bits & bit: file.write("1%d\n" % ndx)
                             else:          file.write("0%d\n" % ndx)
-                last = bits
+                last      = bits
+                prev_bits = bits
             elif save_as == DigitalFormat.CSV:
-                file.write('%g' % (tcks / CPU_HZ))
+                # nanosecond resolution ("%g" would round to 6 digits,
+                #   i.e. to 10s of microseconds once past 1 second)
+                file.write('%.9f' % (tcks / CPU_HZ))
                 for ndx in active_ndxs:
                     if bits & (1 << ndx):
                         file.write(",1")
@@ -4146,7 +4336,7 @@ def upload_digital(samples   ,
                                 delt                      ,
                                 TimeVal.str(delt / CPU_HZ))  )
             linenumber += 1
-            if linenumber >= term_size - 4:
+            if linenumber >= term_size - 4 and interactive:
                 sys.stdout.write("<ENTER> to continue, "
                                  "any letter+<ENTER> to abort):  ")
                 sys.stdout.flush()
@@ -4161,7 +4351,7 @@ def upload_digital(samples   ,
             # PulseView doesn't show last edge transition, so
             #   generate fake duplicate of last bits
             timval += 2.0   # make sure doesn't round to same as previous
-            file.write('#%d\n' % int(round(timval)))
+            file.write('#%d\n' % (int(round(timval)) * vcd_mult))
             for ndx in active_ndxs:
                 bit = 1 << ndx
                 if bits & bit: file.write("1%d\n" % ndx)
@@ -4256,6 +4446,110 @@ def upload_digital(samples   ,
                                      immed=True,one_line=True           )
 
 
+def write_analog_sr(file, sample_seconds, channels):
+    """sigrok session ("srzip") file, as read by pulseview and sigrok-cli.
+    channels: [(name, [values]), ...], all same length."""
+    metadata = ["[global]"                                   ,
+                "sigrok version=0.5.2"                       ,
+                ""                                           ,
+                "[device 1]"                                 ,
+                "samplerate=%d" % int(round(1.0 / sample_seconds)),
+                "total analog=%d" % len(channels)            ]
+    for (ndx, (name, values)) in enumerate(channels):
+        metadata.append("analog%d=%s" % (ndx + 1, name))
+    with zipfile.ZipFile(file, 'w', zipfile.ZIP_DEFLATED) as srzip:
+        srzip.writestr('version' , '2'                       )
+        srzip.writestr('metadata', '\n'.join(metadata) + '\n')
+        for (ndx, (name, values)) in enumerate(channels):
+            srzip.writestr('analog-1-%d-1' % (ndx + 1)                    ,
+                           struct.pack('<%df' % len(values), *values))
+
+
+
+def write_analog_vcd(file, sample_seconds, channels):
+    """VCD with real-valued variables, as read by gtkwave (right-click
+    signal, Data Format -> Analog -> Step or Interpolated).
+    channels: [(name, [values]), ...], all same length."""
+    file.write("$timescale 1 ns $end\n"  )
+    file.write("$scope module top $end\n")
+    for (ndx, (name, values)) in enumerate(channels):
+        file.write("$var real 64 %d %s $end\n" % (ndx, name))
+    file.write("$upscope $end\n"       )
+    file.write("$enddefinitions $end\n")
+    lasts = [None] * len(channels)
+    for num in range(len(channels[0][1])):
+        lines = []
+        for (ndx, (name, values)) in enumerate(channels):
+            if values[num] != lasts[ndx]:
+                lines.append("r%.9g %d\n" % (values[num], ndx))
+                lasts[ndx] = values[num]
+        if lines:
+            file.write('#%d\n' % int(round(num * sample_seconds * 1e9)))
+            file.writelines(lines)
+    # so viewers show full duration of last sample
+    end_time = int(round(len(channels[0][1]) * sample_seconds * 1e9))
+    file.write('#%d\n' % end_time)
+    return end_time
+
+
+
+def write_analog_gtkw(filename, end_time, channels):
+    """gtkwave "save file" to go with write_analog_vcd()'s: signals already
+    added, drawn as analog waveforms instead of numbers, whole capture in
+    view. Returns its name, or None if couldn't write."""
+    gtkw = os.path.splitext(filename)[0] + '.gtkw'
+    try:
+        with open(gtkw, 'w') as file:
+            file.write("[timestart] 0\n")
+            # zoom: 2**-zoom time units per 200 pixels, fit to c. 600
+            file.write(  "*%f 0 %s\n"
+                       % (-math.log(max(end_time, 1) / 3.0, 2),
+                          ' '.join(['-1'] * 26)               ))
+            for (name, values) in channels:
+                file.write("@88022\n"          )  # analog step, full scale
+                file.write("top.%s\n" % name   )
+                file.write("@20000\n-\n-\n-\n")  # 3 more rows of height
+    except Exception as error:
+        sys.stderr.write(  "Can't write gtkwave save file %s: %s\n"
+                         % (gtkw, error)                          )
+        return None
+    return gtkw
+
+
+
+def analog_viewer_command(save_as, gtkw=None):
+
+
+    """Viewer commandline for "analog-frmt=sr" or "=vcd", or None (after
+    explaining why) if "viewer-vcd=" program can't show that format"""
+    viewer = upload_config['viewer-vcd'].val
+    if viewer == Viewer.OTHER:
+        return upload_config['other-vcd'].val or None
+    if save_as == AnalogFormat.SR:
+        if viewer == Viewer.PULSEVIEW:
+            return "pulseview %s"
+        advice = "\"gtkwave\" can't load sigrok session files, use "  \
+                 "\"analog-frmt=vcd\" with it."
+    else:
+        if viewer == Viewer.GTKWAVE:
+            if gtkw: return "gtkwave %s " + shlex.quote(gtkw)
+            else:    return "gtkwave %s"
+        advice = "\"pulseview\" doesn't show analog signals in VCD " \
+                 "files, use \"analog-frmt=sr\" with it."
+    if viewer in (Viewer.PULSEVIEW, Viewer.GTKWAVE):
+        Pager(stream=sys.stderr)(advice + " Not running viewer.",
+                                 immed=True, one_line=True      )
+    else:
+        Pager(stream=sys.stderr) \
+             ("\"viewer-vcd=%s\" can't show \"analog-frmt=%s\" files. "
+              "Not running viewer."
+              % (upload_config['viewer-vcd' ].str(),
+                 upload_config['analog-frmt'].str()),
+              immed=True, one_line=True             )
+    return None
+
+
+
 def upload_analog(samples     ,
                   first       ,
                   count       ,
@@ -4333,7 +4627,7 @@ def upload_analog(samples     ,
                     time_printf   ,
                     trig_chan_name,
                     trgr_printf   )
-        if file:
+        if file and save_as == AnalogFormat.CSV:
             file.write("time,%s\n" % trig_chan_name)
     else: # two channels
         printf =   "%%4d   %s    %s %s   %s %s\n"   \
@@ -4342,8 +4636,12 @@ def upload_analog(samples     ,
                     trgr_printf   ,
                     scnd_chan_name,
                     scnd_printf   )
-        if file:
+        if file and save_as == AnalogFormat.CSV:
             file.write("time,%s,%s\n" % (trig_chan_name, scnd_chan_name))
+
+    # "analog-frmt=sr" and "=vcd" are written from these after the loop
+    values_1 = []
+    values_2 = []
 
     if not file:
         term_size   = shutil.get_terminal_size().lines
@@ -4371,23 +4669,63 @@ def upload_analog(samples     ,
                                  ranged_1  ,
                                  ranged_2  )
         if file:
-            if num_channels == 1:
-                file.write("%g,%g\n%g,%g\n" % ( num * tick     ,
-                                                ranged_1       ,
-                                               (num + 1) * tick,
-                                                ranged_2)      )
+            if save_as != AnalogFormat.CSV:
+                if num_channels == 1:
+                    values_1.append(ranged_1)
+                    values_1.append(ranged_2)
+                else:
+                    values_1.append(ranged_1)
+                    values_2.append(ranged_2)
+            # times to 9 digits: "%g" (6) is coarser than the sample
+            #   period by the end of a full capture at the fastest rates
+            elif num_channels == 1:
+                file.write("%.9g,%g\n%.9g,%g\n" % ( num * tick     ,
+                                                    ranged_1       ,
+                                                   (num + 1) * tick,
+                                                    ranged_2)      )
             else:
-                file.write("%g,%g,%g\n" % (num * tick, ranged_1, ranged_2))
+                file.write("%.9g,%g,%g\n" % (num * tick, ranged_1, ranged_2))
         else:
             sys.stdout.write(text)
             linenumber += 1
-            if linenumber + extra_lines >= term_size - 1:
+            if linenumber + extra_lines >= term_size - 1 and interactive:
                 sys.stdout.write("<ENTER> to continue, any letter to abort):  ")
                 sys.stdout.flush()
                 if sys.stdin.readline()[0] not in " \n":
                     break
                 linenumber  = 0
                 extra_lines = 0
+
+    if file and save_as != AnalogFormat.CSV:
+        channels = [(trig_chan_name, values_1)]
+        if num_channels == 2:
+            channels.append((scnd_chan_name, values_2))
+        gtkw = None
+        if save_as == AnalogFormat.SR:
+            write_analog_sr(file, SAMPLE_MICROSECONDS[sample_rate], channels)
+            file.close()
+        else:
+            end_time = write_analog_vcd(file                            ,
+                                        SAMPLE_MICROSECONDS[sample_rate],
+                                        channels                        )
+            file.close()
+            gtkw = write_analog_gtkw(filename, end_time, channels)
+        if not upload_config['auto-analog'].val:
+            return
+        commandline = analog_viewer_command(save_as, gtkw)
+        if not commandline:
+            return
+        if '%s' in commandline:
+            commandline = commandline % filename
+        sys.stdout.write("Viewer commandline:\n%s\n" % commandline)
+        sys.stdout.write("Running above command "
+                         "(\"auto-analog=enabled\") ...\n")
+        try:
+            subprocess.call(shlex.split(commandline))
+        except Exception as error:
+            Pager(stream=sys.stderr)("Viewer command failed: %s" % error,
+                                     immed=True,one_line=True           )
+        return
 
     if file:
         if upload_config['viewer-csv'].val == Viewer.GNUPLOT:
@@ -5205,7 +5543,7 @@ def trig_cmd(cmd, input, fields):
             try:
                 num = int(num)
             except ValueError:
-                sys.stderr.write(  "Trigger number \"%s\ not an integer\n"
+                sys.stderr.write(  "Trigger number \"%s\" not an integer\n"
                                  % num)
                 return
             if num not in range(256):
@@ -5348,6 +5686,18 @@ def dgtl_cmd(cmd, input, fields):
                         "Continue anyway?"                   ):
             return
     max_trig = max([ndx for ndx in triggers_config])
+
+    if     digital_config['mode'].val == SamplingMode.EDGE   \
+       and firmware_version is not None                      \
+       and firmware_version  < EDGE_MODE_VERSION            :
+        Pager(stream=sys.stderr) \
+             (  "\"logic mode=edge\" needs firmware %s or later, "
+                "connected device has %s. Use another \"mode=\" "
+                "or update the firmware."
+              % ('.'.join([str(elem) for elem in EDGE_MODE_VERSION]),
+                 '.'.join([str(elem) for elem in firmware_version ])),
+              immed=True, one_line=True                              )
+        return
 
     if digital_config['duration'].enabled():
         duration    = digital_config['duration'].val
@@ -5597,18 +5947,17 @@ def upld_cmd(cmd, input, fields):
                 immed=True, one_line=True                                    )
         return
 
-    samples = [0] * count
-    for ndx in range(count):
-        sample = wait_read(4, 2.0)
-        if sample in (WAIT_READ_STDIN, None):
-            Pager(stream=sys.stderr) \
-                 (  "Upload of %d samples interrupted/failed @ #%d\n"
-                  % (count, ndx + 1)                                 ,
-                  immed=True, one_line=True                          )
-            cmnd_cmd(HALT_CMD)
-            flush_read(2.0)
-            return
-        samples[ndx] = struct.unpack('I', sample)[0]
+    # all samples in as few reads as the OS allows, not one per sample
+    (data, status) = exact_read(4 * count, 2.0)
+    if len(data) != 4 * count:
+        Pager(stream=sys.stderr) \
+             (  "Upload of %d samples interrupted/failed @ #%d\n"
+              % (count, len(data) // 4 + 1)                      ,
+              immed=True, one_line=True                          )
+        cmnd_cmd(HALT_CMD)
+        flush_read(2.0)
+        return
+    samples = struct.unpack('<%dI' % count, data)
 
     if sampling_mode == SamplingMode.ANALOG:
         save_as = upload_config['analog-frmt' ].val
@@ -5622,7 +5971,12 @@ def upld_cmd(cmd, input, fields):
         filename = upload_config['file'].val
         if not filename.endswith('.%s' % suffix):
             filename += '.%s' % suffix
-        file = safe_open(filename, " for saving captured data", 'w')
+        file = safe_open(filename                                    ,
+                         " for saving captured data"                 ,
+                              'wb'
+                         if   (    sampling_mode == SamplingMode.ANALOG
+                               and save_as       == AnalogFormat.SR    )
+                         else 'w'                                    )
     else:
         filename = None
         file     = None
@@ -5657,7 +6011,7 @@ Digital ("logic") samples:
   logic samples: 0...31 @ of 32 (max 4842)
 - One line per sample. Example:
     23  0xd3  11010011   gry vio ... grn ... ... red brn        622  8.63889μs
-  \--/  \--/  \------/   \-----------------------------/   \------/  \-------/
+  \\--/  \\--/  \\------/   \\-----------------------------/   \\------/  \\-------/
    |     |       |           |                                |          |
    |     |       |           +-- port name ("configure        |          |
    |     |       |               names <bit>=<name>") if      |          |
@@ -5675,7 +6029,7 @@ Analog ("oscope") samples:
   239.5+12.5@12MHz->47.6kHz
 - One line per one- or two-channel  samples. Example:
   37      1554.00 μs    PA0 1.631V   PA1 77.9°F
-  \--/    \----------/  \--------/   \--------/
+  \\--/    \\----------/  \\--------/   \\--------/
    |           |             |            |
    |           |             |            +-- second channel value
    |           |             +-- trigger channel value
@@ -5951,10 +6305,10 @@ Lines printed if rate limiting ("rate=<time>") time elapsed and any of the follo
 Prints one or more fields depending on enabled configurations/parameters:
   all:
       004.491
-      \-----/  seconds since command start ("monitor printf=<format code>")
+      \\-----/  seconds since command start ("monitor printf=<format code>")
   digital: ("pb4-11=enabled") state of digital ports PB4 to PB11. Example:
       10111011   gry ... blu grn yel ... red brn
-      \------/   \-----------------------------/
+      \\------/   \\-----------------------------/
          |           |
          |           +-- port name ("configure names <bit>=<name>")
          |               if port high else "..."
@@ -6141,9 +6495,9 @@ Transmit and/or receive UART/USART serial data.
   - Usart xmit and/or recv data to socket and/or pty if either active, else to terminal
 Terminal I/O, asynchronous mode:
   - If "recv=enabled" will print asynchronous recv data to terminal.
-  - <ENTER> key to pause recv data and enter line of ascii data and/or <\\xXY\> hexadecimal values, <ENTER> key to xmit.
+  - <ENTER> key to pause recv data and enter line of ascii data and/or <\\xXY\\> hexadecimal values, <ENTER> key to xmit.
 Terminal I/O, synchronous mode:
-  - "master" mode: enter line of ascii data and/or <\\xXY\> hexadecimal values, <ENTER> key to xmit
+  - "master" mode: enter line of ascii data and/or <\\xXY\\> hexadecimal values, <ENTER> key to xmit
   - Will display recv data bytes (same number as xmitted) and prompt for next line of xmit data
 Terminal I/O, both modes:
   - Input line of ascii or numeric data (\"gpio ascii-num=") then <ENTER> key to send. See data entry instructions at command start.
@@ -6620,17 +6974,20 @@ def pre_input_hook():
 #
 #
 
-def main(quiet, acm_name, no_auto_viewer, load_file, halt):
+def main(quiet, acm_name, no_auto_viewer, load_file, halt, script=None,
+         keep_going=False):
+    """script: None for interactive use, else list of (source, command)"""
+    global dev_acm, usb_fd, interactive
+
+    if script is not None:
+        interactive = False
+        # count error messages, to stop script and set exit status
+        sys.stderr = ErrorCounter(sys.stderr)
+
     if not quiet:
         sys.stdout.write(BANNER)
 
-    global dev_acm, usb_fd
-
-    if acm_name:
-        if   acm_name.startswith('/dev'): dev_acm =              acm_name
-        elif acm_name.startswith( 'tty'): dev_acm = '/dev/'    + acm_name
-        elif acm_name.startswith(   '.'): dev_acm =              acm_name
-        else:                             dev_acm = '/dev/tty' + acm_name
+    dev_acm = choose_device(acm_name, quiet, find_devices())
 
     usb_connect()
 
@@ -6656,11 +7013,24 @@ def main(quiet, acm_name, no_auto_viewer, load_file, halt):
     data_history = []
 
     empty_line_helped = False
+    failed            = 0
     while True:
-        user_input = safe_input("$1.50: "                        ,
-                                "main"                           ,
-                                "Use \"quit\" (or \"q\") to exit")
-        completer.flush_cache()  # so doesn't complete with old if same input
+        if script is not None:
+            if not script:
+                sys.exit(1 if failed else 0)
+            (source, user_input) = script.pop(0)
+            errors_before        = sys.stderr.count
+            if user_input.strip():
+                sys.stdout.write("$1.50: %s\n" % user_input)
+                sys.stdout.flush()
+        else:
+            user_input = safe_input("$1.50: "                        ,
+                                    "main"                           ,
+                                    "Use \"quit\" (or \"q\") to exit")
+            completer.flush_cache()  # so doesn't complete with old if same
+
+        if not user_input and script is not None:
+            continue
 
         if not user_input:
             if not empty_line_helped:
@@ -6705,6 +7075,15 @@ def main(quiet, acm_name, no_auto_viewer, load_file, halt):
 
             COMMANDS[cmd].func(COMMANDS[cmd].code, user_input, fields[1:])
 
+            if script is not None and sys.stderr.count > errors_before:
+                failed += 1
+                if not keep_going:
+                    sys.stderr.write(  "Stopping: error in %s (use "
+                                       "--keep-going to continue after "
+                                       "errors)\n"
+                                     % source                          )
+                    sys.exit(1)
+
             data_hist_len = readline.get_current_history_length()
             for ndx in range(len(data_history) + 1, data_hist_len + 1):
                 data_history.append(readline.get_history_item(ndx))
@@ -6714,6 +7093,50 @@ def main(quiet, acm_name, no_auto_viewer, load_file, halt):
         else:
             Pager(stream=sys.stderr)('%s\n' % disambig.error,
                                      immed=True, final=False)
+            if script is not None:
+                failed += 1
+                if not keep_going:
+                    sys.stderr.write("Stopping: error in %s\n" % source)
+                    sys.exit(1)
+
+
+
+class ErrorCounter(object):
+    """stderr wrapper counting non-blank writes. In scripted operation a
+    command that writes to stderr is taken to have failed."""
+    def __init__(self, stream):
+        self.stream = stream
+        self.count  = 0
+    def write(self, text):
+        if text.strip():
+            self.count += 1
+        return self.stream.write(text)
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+
+def read_script(commands, script_file):
+    """[(source, command), ...] from --command list and --script file
+    ("-" for stdin), in that order"""
+    script = [("--command #%d" % (num + 1), command)
+              for (num, command) in enumerate(commands or [])]
+    if script_file:
+        try:
+            if script_file == '-':
+                lines = sys.stdin.read().splitlines()
+                name  = '<stdin>'
+            else:
+                with open(script_file) as file:
+                    lines = file.read().splitlines()
+                name = script_file
+        except (OSError, UnicodeDecodeError) as error:
+            sys.stderr.write(  "Can't read script %s: %s\n"
+                             % (script_file, error)       )
+            sys.exit(1)
+        script += [("%s line %d" % (name, num + 1), line)
+                   for (num, line) in enumerate(lines)]
+    return script
 
 
 
@@ -6762,11 +7185,44 @@ def parse_commandline():
                              "reset and/or power cycle, and USB re-enumeration "
                              "required."                                      )
 
+    parser.add_argument('-l', '--list',
+                        action="store_true",
+                        help="List connected devices with buck50's USB ids "
+                             "(and their serial numbers) and exit")
+
+    parser.add_argument('-c', '--command',
+                        action='append',
+                        metavar='COMMAND',
+                        help="Run COMMAND (e.g. \"logic edges=100\") "
+                             "instead of prompting; may be repeated. "
+                             "Exits when done: status 1 if a command "
+                             "reported an error")
+
+    parser.add_argument('-s', '--script',
+                        metavar='FILE',
+                        help="Run commands from FILE, one per line, "
+                             "\"#\" comments (\"-\" for stdin; commands "
+                             "piped to stdin are run this way anyway). "
+                             "After any --command(s). Exit as --command")
+
+    parser.add_argument('-y', '--yes',
+                        action="store_true",
+                        help="With --command/--script: answer \"Y\" to "
+                             "questions, e.g. overwriting an existing file "
+                             "(default \"n\")")
+
+    parser.add_argument('-k', '--keep-going',
+                        action="store_true",
+                        help="With --command/--script: continue after a "
+                             "command reports an error")
+
     parser.add_argument("acm",
                         nargs='?',
-                        default=DEV_ACM,
-                        help="CDC/ACM device (with or without \"/dev\" or "
-                             "\"/dev/tty\" prefix)")
+                        default=argparse.SUPPRESS,  # no "(default: None)"
+                        help="CDC/ACM device, with or without \"/dev\" or "
+                             "\"/dev/tty\" prefix, or a device's USB serial "
+                             "number (see --list). Default: first device "
+                             "with buck50's USB ids, else %s" % DEV_ACM)
 
     return parser.parse_args()
 
@@ -6779,4 +7235,23 @@ if __name__ == '__main__':
         sys.stdout.write("%s\n" % COPYRIGHT)
         sys.exit(0)
 
-    main(args.quiet, args.acm, args.no_auto_viewer, args.file, args.halt)
+    if args.list:
+        devices = find_devices()
+        for (path, serial) in devices:
+            sys.stdout.write("%s  %s\n" % (path, serial or "<no serial>"))
+        if not devices:
+            sys.stderr.write(  "No devices with buck50's USB ids (%s:%s)\n"
+                             % USB_VENDOR_PRODUCT                         )
+        sys.exit(0 if devices else 1)
+
+    script = None
+    if args.command or args.script or not sys.stdin.isatty():
+        script = read_script(args.command,
+                             args.script or (    None
+                                             if  sys.stdin.isatty()
+                                             or  args.command
+                                             else '-'           ))
+    assume_yes = args.yes
+
+    main(args.quiet, getattr(args, 'acm', None), args.no_auto_viewer,
+         args.file, args.halt, script, args.keep_going)
