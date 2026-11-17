@@ -1,6 +1,7 @@
 # buck50
 
 [![CI](https://github.com/Zektopic/buck50/actions/workflows/ci.yml/badge.svg)](https://github.com/Zektopic/buck50/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Zektopic/buck50?include_prereleases&label=release)](https://github.com/Zektopic/buck50/releases)
 [![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE.txt)
 
 Open-source firmware and host software that turn a US$1.50 "Blue Pill"
@@ -22,10 +23,12 @@ viewers, a reproducible build, and automated tests. See
 - [Status](#status)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Scripted use](#scripted-use)
 - [Pin assignments](#pin-assignments)
 - [Viewing captures](#viewing-captures)
 - [Logic analyzer capture modes](#logic-analyzer-capture-modes)
 - [Building the firmware](#building-the-firmware)
+- [Releases](#releases)
 - [Testing](#testing)
 - [Documentation](#documentation)
 - [What this fork changes](#what-this-fork-changes)
@@ -58,7 +61,8 @@ Read this before flashing.
 
 If you need something known to work today, flash 0.9.2 and use the
 `buck50.py` from this repository: everything except `logic mode=edge`
-works with it. If you can test 0.9.3 on a board, the steps are in
+works with it. Prebuilt files for each version are on the
+[Releases](https://github.com/Zektopic/buck50/releases) page. If you can test 0.9.3 on a board, the steps are in
 [ROADMAP.md](ROADMAP.md) and results are very welcome.
 
 
@@ -74,7 +78,9 @@ works with it. If you can test 0.9.3 on a board, the steps are in
 
 ## Quick start
 
-**1. Flash the firmware** (once). With an ST-Link and
+**1. Flash the firmware** (once). Download `buck50-firmware-<version>.bin`
+from [Releases](https://github.com/Zektopic/buck50/releases), or use
+`build/buck50.bin` from this repository. With an ST-Link and
 [stlink](https://github.com/stlink-org/stlink):
 
     st-flash write build/buck50.bin 0x08000000
@@ -84,11 +90,17 @@ or with OpenOCD:
     openocd -f interface/stlink.cfg -f target/stm32f1x.cfg \
             -c "program build/buck50.elf verify reset exit"
 
-**2. Connect** the board's USB port. It appears as a CDC-ACM serial device,
-normally `/dev/ttyACM0`. Your user needs access to it (on most distributions,
-membership of the `dialout` group).
+**2. Connect** the board's USB port. It appears as a CDC-ACM serial device
+(`/dev/ttyACM<n>`). For access without joining the `dialout` group, a stable
+name, and to keep ModemManager from probing the port, install the udev rule
+once:
 
-**3. Run the host program:**
+    sudo cp tools/70-buck50.rules /etc/udev/rules.d/
+    sudo udevadm control --reload && sudo udevadm trigger
+
+**3. Run the host program.** It finds the board by its USB ids; `--list`
+shows what it found, and a device file or the board's USB serial number
+selects one when several are connected.
 
     $ build/buck50.py              # or: build/buck50.py /dev/ttyACM1
     Connecting to buck50 device (press CTRL-C to abort ...  )
@@ -124,6 +136,26 @@ USART bridge to a pseudo-terminal, 1 kHz pulses on PA1-PA3:
     $ test/fake_buck50.py
     Fake buck50 device on /dev/pts/7 -- run:
         buck50.py -x /dev/pts/7
+
+
+## Scripted use
+
+Commands can come from the command line, a file, or a pipe instead of the
+prompt, for automated captures and test rigs:
+
+    buck50.py -x -c "logic edges=1000 duration=0.5s" \
+                 -c "dump output=file file=run1 digital-frmt=vcd"
+    buck50.py -x -s capture.txt         # one command per line, "#" comments
+    printf 'logic\ndump output=terminal\n' | buck50.py -x
+
+In this mode nothing prompts: questions such as "overwrite existing file?"
+are answered "n" (`--yes` for "Y"), long output isn't paged, and `<ENTER>`
+doesn't abort a wait (CTRL-C still does). Each command is echoed after
+`$1.50:`. The run stops at the first command that reports an error and
+exits with status 1 (`--keep-going` runs the rest, still exiting 1); 0
+means every command succeeded. Use `-x` so no viewer windows open. The
+bridge commands (`usart`, `spi`, `i2c` with terminal I/O) and `reset blink`
+are interactive by nature and need the prompt.
 
 
 ## Pin assignments
@@ -227,6 +259,41 @@ committed binaries are not what the committed source compiles to. Other
 compiler versions will build, but produce different, untested binaries.
 
 
+## Releases
+
+[Releases](https://github.com/Zektopic/buck50/releases) are built by
+`.github/workflows/release.yml` on a self-hosted runner. Each one carries
+the firmware as `.bin`, `.hex` and `.elf`, `buck50.py`, the udev rule, and
+`SHA256SUMS`. Before publishing, the workflow builds the firmware with the
+pinned toolchain, fails if it differs from the committed binaries, and runs
+the firmware emulation, host and scripting tests against it. A release's
+files are therefore exactly what its tagged source compiles to.
+
+To make a release:
+
+1. Set the version in `build/src/buck50.cxx` (and `build/buck50.py` if it
+   changed), run `make firmware`, add a `RELEASE_NOTES.txt` entry, and
+   commit.
+2. Push a tag named after the firmware version: `v0.9.3`, or with a suffix
+   such as `v0.9.3-rc1` for a pre-release. Alternatively use
+   **Actions → Firmware release → Run workflow**, which also has a
+   build-only mode (no tag; files attached to the run).
+3. Have a runner available. On any Linux machine with Docker and `gh`
+   logged in as a repository admin:
+
+       tools/selfhosted-runner.sh
+
+   This registers a runner for this repository only, runs one job, and
+   removes itself from GitHub. Jobs wait in the queue until a runner
+   appears, so the order of steps 2 and 3 doesn't matter.
+
+The workflow runs only on tag pushes and manual runs, which need write
+access, never on pull requests. The runner hands jobs the host's Docker
+daemon, so start it only when you mean to run a release. To use a different
+runner pool, set the repository variable `FIRMWARE_RUNNER_LABELS` to a JSON
+list of labels (default `["self-hosted", "manupa-hnx"]`).
+
+
 ## Testing
 
     pip install -r test/requirements.txt
@@ -235,6 +302,7 @@ compiler versions will build, but produce different, untested binaries.
 | Suite | What it runs | Needs |
 |-------|--------------|-------|
 | `test/test_host.py` | The real `buck50.py` on a pseudo-terminal against a simulated device speaking the USB protocol | pytest |
+| `test/test_scripting.py` | `--command`, `--script` and piped operation, exit status, device discovery | pytest |
 | `test/test_viewers.py` | Export files through sigrok-cli, GTKWave's converters and gnuplot (skipped individually if not installed) | `apt install sigrok-cli gtkwave gnuplot-nox` |
 | `test/test_firmware.py` | The firmware's trigger and capture assembly from `build/buck50.elf`, in a Cortex-M3 emulator, against scripted input signals | unicorn, pyelftools |
 
@@ -257,6 +325,7 @@ Repository layout:
     build/          firmware source, Makefile, prebuilt binaries, buck50.py
     build/src/      buck50.cxx (firmware), buck50_asm.s (capture loops)
     test/           simulated device, tests, firmware emulation harness
+    tools/          udev rule, self-hosted release runner script
     docs/           manual
     images/         pinout and viewer screenshots
 
@@ -271,11 +340,14 @@ Relative to upstream firmware 0.9.2 / `buck50.py` 0.9.6:
   GTKWave (analog VCD); GTKWave no longer shows unchanged logic signals as
   undefined; standard VCD timescale for GTKWave's converters; nanosecond
   resolution in CSV.
-- **Host program:** about 4x faster sample upload, Python 3.12+ warnings
-  fixed, firmware version check that accepts older firmware.
+- **Host program:** scripted operation (`--command`, `--script`, pipes) with
+  exit status; finds the board itself (`--list`, select by serial number);
+  about 4x faster sample upload; Python 3.12+ warnings fixed; firmware
+  version check that accepts older firmware; udev rule.
 - **Firmware fixes:** an out-of-bounds read during connection, and an
   unvalidated capture mode.
-- **Engineering:** reproducible Docker build, three test suites, CI.
+- **Engineering:** reproducible Docker build, four test suites, CI, and
+  release builds on a self-hosted runner.
 
 Details are in [RELEASE_NOTES.txt](RELEASE_NOTES.txt).
 

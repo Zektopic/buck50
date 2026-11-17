@@ -51,6 +51,10 @@ Done (firmware 0.9.3, buck50.py 0.9.7)
   72 emulated tests of the trigger/capture assembly; CI for all three plus
   a check that committed binaries match the source.
 * Short README; the original became `docs/MANUAL.md`.
+* Scripted operation (`--command`, `--script`, pipes, exit status) and
+  device discovery (`--list`, select by USB serial), with tests; udev rule.
+* Release pipeline: tag push or manual run builds, verifies and publishes
+  firmware from a self-hosted runner (`tools/selfhosted-runner.sh`).
 
 
 Next, in order
@@ -109,15 +113,12 @@ hand-written assembly, the compiler doesn't see them).
 
 ### 3. Features (developable against `test/fake_buck50.py`, no hardware)
 
-* **Scriptable operation:** `buck50.py --run "logic ...; dump ..."` and
-  command files. Today input can't be piped in, because input arriving
-  while waiting for the device means "abort". Unlocks automation and
-  hardware-in-the-loop tests.
 * **Protocol decoding:** a `decode` command which hands the capture to
   `sigrok-cli` decoders (UART, I2C, SPI) and prints the result. Doing it by
   hand on a saved VCD already works and is tested.
-* **Packaging:** `pyproject.toml` and a `buck50` console command; a udev
-  rule for a stable `/dev/buck50` and non-root access.
+* **Packaging:** `pyproject.toml` and a `buck50` console command (the
+  host program lives in `build/`, which clashes with setuptools' own
+  `build/` directory, so this needs a small layout change first).
 * **Report the chip:** read the MCU ID and flash size at connect.
   Clone chips (GD32, CKS32, APM32) have different instruction timing, so
   speed reports are only comparable with this.
@@ -131,8 +132,8 @@ hand-written assembly, the compiler doesn't see them).
 * **Loopback self-test** (needs hardware, and three jumper wires): the
   `pulse` generator keeps running on PA1-PA3 during other commands; wired
   to PB4-PB6 it gives `logic` known frequencies and duty cycles to check
-  against. With scriptable operation this becomes a one-command hardware
-  regression test.
+  against. Scripted operation now exists, so this is one `--script` file
+  plus a checker: a one-command hardware regression test.
 * Extend `fake_buck50.py` to `monitor`, `usart`, `spi`, `i2c`, `pulse`,
   `numbers`: about 5000 lines of `buck50.py` currently have no tests.
 * Emulate more than the capture assembly (needs clock and USB peripheral

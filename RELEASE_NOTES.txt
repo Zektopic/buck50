@@ -30,7 +30,16 @@ buck50.py:
 * Fixed invalid string escape sequences (SyntaxWarning in Python 3.12,
   error in future versions), "help logic mode=" typos for code-mem=ram,
   message typo in "trigger".
-* Exits at end of redirected stdin instead of looping forever.
+* Scripted operation: -c/--command (repeatable), -s/--script FILE ("-":
+  stdin), or commands piped to stdin. No prompts (-y/--yes to answer "Y"),
+  no paging, <ENTER> not watched; stops at first command reporting an
+  error with exit status 1 (-k/--keep-going to continue). Gives up after
+  5 connection attempts instead of retrying forever.
+* Finds the device: first CDC-ACM port with the firmware's USB ids
+  (0483:5740) instead of always /dev/ttyACM0; -l/--list shows them; the
+  device argument may also be a USB serial number.
+* tools/70-buck50.rules: udev rule for console-user access,
+  /dev/buck50-<serial>, and ModemManager ignoring the port.
 * Waveform viewers:
   - "dump analog-frmt=sr": sigrok session file, opens in pulseview with
     analog traces at correct sample rate.
@@ -52,6 +61,11 @@ Build and test:
 * test/: simulated device and end-to-end buck50.py tests; export files
   through the viewers' own readers; emulated tests of the
   triggering/sampling assembly. GitHub Actions CI.
+* .github/workflows/release.yml: builds firmware on a self-hosted runner
+  with the pinned toolchain, checks it against the committed binaries,
+  runs tests, publishes a GitHub release with .bin/.hex/.elf, buck50.py,
+  udev rule and SHA256SUMS. tools/selfhosted-runner.sh starts a
+  single-use runner for it.
 * README.md rewritten as a short introduction; the original README is now
   docs/MANUAL.md. README.html (generated, stale) removed.
 
