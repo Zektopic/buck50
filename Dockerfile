@@ -2,10 +2,19 @@
 #
 # Pins the exact compiler the committed build/buck50.{bin,hex,elf} were
 # built with (GNU Arm Embedded Toolchain 9-2020-q2-update, GCC 9.3.1), so
-# that "make firmware" reproduces them byte for byte.  See "Building from
-# source" in README.md.
+# that builds reproduce them byte for byte.  Stages:
+#
+#   toolchain  compiler only; "make firmware" mounts build/ into it
+#   firmware   the built files, for
+#                docker build --target firmware --output type=local,dest=out .
+#   test       the test suites run against the freshly built firmware
+#                docker build --target test .
+#
+# The firmware and test stages copy the source into the build instead of
+# mounting it, so they work the same with a remote Docker daemon (e.g. a
+# self-hosted Actions runner in a container using the host's socket).
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS toolchain
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -26,3 +35,22 @@ ENV GCC_ARM_ROOT=/opt/gcc-arm-none-eabi
 
 WORKDIR /src
 CMD ["make"]
+
+
+FROM toolchain AS build
+COPY build/ /src/
+RUN make clean all
+
+
+FROM scratch AS firmware
+COPY --from=build /src/buck50.elf /src/buck50.bin /src/buck50.hex /src/buck50.elf.map /
+
+
+FROM python:3.12-slim AS test
+COPY test/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY . /repo
+COPY --from=build /src/buck50.elf /repo/build/buck50.elf
+WORKDIR /repo
+RUN python -m pytest -q -p no:cacheprovider \
+        test/test_firmware.py test/test_host.py test/test_scripting.py

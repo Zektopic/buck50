@@ -1,0 +1,201 @@
+name: Firmware release
+
+# Builds the firmware on a self-hosted runner with the pinned toolchain
+# (Dockerfile), fails if the result differs from the committed binaries,
+# runs the tests against it, and publishes a GitHub release with the files.
+#
+# Triggers: pushing a tag "v<firmware version>[-suffix]" (e.g. v0.9.3,
+# v0.9.3-rc1), or "Run workflow" in the Actions tab (with no tag: build and
+# test only, files attached to the run as an artifact). Both need write
+# access to the repository; this workflow never runs for pull requests, so
+# it never runs outside code on the self-hosted runner.
+#
+# Runner: labels from repository variable FIRMWARE_RUNNER_LABELS (a JSON
+# list), default ["self-hosted", "manupa-hnx"]. The runner needs only Docker
+# with buildx, as in the official actions-runner image.
+# tools/selfhosted-runner.sh starts a single-use one on any Docker host.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create, "v<firmware version>[-suffix]". Empty: build and test only.'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, test and publish firmware
+    runs-on: ${{ fromJSON(vars.FIRMWARE_RUNNER_LABELS || '["self-hosted", "manupa-hnx"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions and tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          firmware=$(sed -n 's/.*VERSION *\[\] *= *{ *\([0-9]*\), *\([0-9]*\), *\([0-9]*\) *}.*/\1.\2.\3/p' build/src/buck50.cxx)
+          host=$(sed -n 's/^VERSION = (\([0-9]*\), *\([0-9]*\), *\([0-9]*\))$/\1.\2.\3/p' build/buck50.py)
+          if [ -z "$firmware" ] || [ -z "$host" ]; then
+            echo "::error::Could not read versions from build/src/buck50.cxx and build/buck50.py"
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag=$GITHUB_REF_NAME
+            case "$tag" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          else
+            tag=$INPUT_TAG
+            prerelease=$INPUT_PRERELEASE
+          fi
+          if [ -n "$tag" ]; then
+            case "$tag" in
+              "v$firmware"|"v$firmware"-*) ;;
+              *) echo "::error::Tag $tag doesn't match firmware version $firmware: use v$firmware or v$firmware-<suffix>"
+                 exit 1 ;;
+            esac
+          fi
+          {
+            echo "firmware=$firmware"
+            echo "host=$host"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+          echo "firmware $firmware, buck50.py $host, tag '${tag:-<none, build only>}', prerelease $prerelease"
+
+      - name: Build firmware (pinned toolchain, in Docker)
+        run: docker build --progress=plain --target firmware --output type=local,dest=out/firmware .
+
+      - name: Check build is identical to committed binaries
+        run: |
+          set -euo pipefail
+          for file in buck50.bin buck50.hex buck50.elf buck50.elf.map; do
+            if ! cmp "out/firmware/$file" "build/$file"; then
+              echo "::error::build/$file is not what the source compiles to. Run \"make firmware\" and commit the result."
+              exit 1
+            fi
+          done
+          sha256sum out/firmware/*
+
+      - name: Tests (emulated firmware, buck50.py against simulated device)
+        run: docker build --progress=plain --target test .
+
+      - name: Package
+        env:
+          FIRMWARE: ${{ steps.meta.outputs.firmware }}
+          HOST: ${{ steps.meta.outputs.host }}
+        run: |
+          set -euo pipefail
+          dir=out/release
+          mkdir -p "$dir"
+          for ext in bin hex elf; do
+            cp "out/firmware/buck50.$ext" "$dir/buck50-firmware-$FIRMWARE.$ext"
+          done
+          cp build/buck50.py build/vcd2txt.py tools/70-buck50.rules "$dir/"
+          (cd "$dir" && sha256sum -- * > SHA256SUMS)
+
+          {
+            echo "Firmware $FIRMWARE and buck50.py $HOST, built from commit \`$GITHUB_SHA\`."
+            echo
+            echo "**Before flashing, read [Status](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/README.md#status)** in the README: it says how each component was verified, and whether this firmware has been tested on hardware."
+            echo
+            echo "### Files"
+            echo
+            echo "| File | |"
+            echo "|------|-|"
+            echo "| \`buck50-firmware-$FIRMWARE.bin\` | Raw image, for \`st-flash write buck50-firmware-$FIRMWARE.bin 0x08000000\` |"
+            echo "| \`buck50-firmware-$FIRMWARE.hex\` | Intel hex, for \`stm32flash\` (serial bootloader) and most GUI flashers |"
+            echo "| \`buck50-firmware-$FIRMWARE.elf\` | With debug info, for OpenOCD / GDB / Black Magic Probe |"
+            echo "| \`buck50.py\` | Host program (Python 3.9+, no dependencies) |"
+            echo "| \`vcd2txt.py\` | VCD to text converter |"
+            echo "| \`70-buck50.rules\` | udev rule: user access, \`/dev/buck50-<serial>\`, ModemManager off |"
+            echo "| \`SHA256SUMS\` | \`sha256sum -c SHA256SUMS\` |"
+            echo
+            echo "### Reproducing"
+            echo
+            echo "The firmware was built with the pinned toolchain in the repository's Dockerfile, and the build was checked to be byte-for-byte identical to the binaries committed at this commit. To check yourself: \`git checkout $GITHUB_SHA && make firmware-check\`."
+            echo
+            echo "### Release notes"
+            echo
+            echo '```text'
+            awk 'NR > 1 && /^[0-9]+\.[0-9]+(\.[0-9]+)?[ \t]/ { exit } { print }' RELEASE_NOTES.txt
+            echo '```'
+          } > out/notes.md
+
+          ls -l "$dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: buck50-${{ steps.meta.outputs.firmware }}-${{ github.sha }}
+          path: out/release/
+          if-no-files-found: error
+
+      - name: Publish release
+        if: steps.meta.outputs.tag != ''
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          TITLE: buck50 firmware ${{ steps.meta.outputs.firmware }} / buck50.py ${{ steps.meta.outputs.host }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { owner, repo } = context.repo;
+            const tag = process.env.TAG;
+
+            try {
+              await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.setFailed(`A release for ${tag} already exists; delete it or use another tag.`);
+              return;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+            // draft first, so the release never appears without its files
+            const { data: release } = await github.rest.repos.createRelease({
+              owner, repo,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: process.env.TITLE,
+              body: fs.readFileSync('out/notes.md', 'utf8'),
+              prerelease: process.env.PRERELEASE === 'true',
+              draft: true,
+            });
+
+            const dir = 'out/release';
+            for (const name of fs.readdirSync(dir).sort()) {
+              const data = fs.readFileSync(path.join(dir, name));
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo,
+                release_id: release.id,
+                name,
+                data,
+                headers: {
+                  'content-type': 'application/octet-stream',
+                  'content-length': data.length,
+                },
+              });
+              core.info(`uploaded ${name} (${data.length} bytes)`);
+            }
+
+            const { data: published } = await github.rest.repos.updateRelease({
+              owner, repo, release_id: release.id, draft: false,
+            });
+            core.notice(`Published ${published.html_url}`);

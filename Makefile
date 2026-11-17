@@ -22,7 +22,7 @@ help:
 	@echo "make docs/MANUAL.html  needs multimarkdown"
 
 firmware-image:
-	$(DOCKER) build -t $(DOCKER_IMAGE) .
+	$(DOCKER) build --target toolchain -t $(DOCKER_IMAGE) .
 
 firmware: firmware-image
 	$(DOCKER) run --rm -u $$(id -u):$$(id -g) -v $(CURDIR)/build:/src $(DOCKER_IMAGE) make
