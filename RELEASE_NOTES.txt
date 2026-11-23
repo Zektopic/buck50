@@ -1,3 +1,76 @@
+0.9.3 buck50.{cxx,elf}  0.9.7 buck50.py    2026 Nov 17 Tue
+-----------------------------------------------------------
+(Zektopic fork)
+
+Firmware:
+* New, experimental, opt-in "logic mode=edge": polls the inputs with
+  load/compare/branch only and reads the time and stores a sample out of
+  line when a change is seen. Estimated c. 10-11MHz polling while inputs
+  are quiet vs. 6.26MHz, but slower directly after each stored change.
+  NOT MEASURED ON HARDWARE -- verified functionally under emulation only.
+  See "logic mode=edge" in README.md.
+* Existing sampling modes' code is unchanged, and now pinned to the same
+  alignment it has in the 0.9.2 binary regardless of other code's size.
+* Fixed wait_connect_signature() reading past the end of
+  CONNECT_SIGNATURE (worked only because of zero padding after it).
+* Unknown sampling mode from host now treated as 6.26MHz instead of
+  jumping to the wrong code.
+* 0.9.3 FIRMWARE AS A WHOLE HAS NOT BEEN RUN ON A "BLUE PILL". The 0.9.2
+  binaries remain available from git history (commit e77172a).
+
+buck50.py:
+* "logic mode=edge" (refused, with explanation, if firmware older than
+  0.9.3).
+* Works without complaint with 0.9.2 firmware; version check now compares
+  against firmware version, not buck50.py's own version (0.9.6 always
+  printed "Warning: Firmware version mismatch").
+* "dump" reads all samples in one go instead of 4 bytes at a time: host
+  side of a full 4826 sample dump to file c. 21ms -> c. 5ms (USB transfer
+  time not included), and no longer fails on reads split by the tty layer.
+* Fixed invalid string escape sequences (SyntaxWarning in Python 3.12,
+  error in future versions), "help logic mode=" typos for code-mem=ram,
+  message typo in "trigger".
+* Scripted operation: -c/--command (repeatable), -s/--script FILE ("-":
+  stdin), or commands piped to stdin. No prompts (-y/--yes to answer "Y"),
+  no paging, <ENTER> not watched; stops at first command reporting an
+  error with exit status 1 (-k/--keep-going to continue). Gives up after
+  5 connection attempts instead of retrying forever.
+* Finds the device: first CDC-ACM port with the firmware's USB ids
+  (0483:5740) instead of always /dev/ttyACM0; -l/--list shows them; the
+  device argument may also be a USB serial number.
+* tools/70-buck50.rules: udev rule for console-user access,
+  /dev/buck50-<serial>, and ModemManager ignoring the port.
+* Waveform viewers:
+  - "dump analog-frmt=sr": sigrok session file, opens in pulseview with
+    analog traces at correct sample rate.
+  - "dump analog-frmt=vcd": real-valued VCD plus ".gtkw" save file, opens
+    in gtkwave as analog waveforms.
+  - Startup viewer search sets "analog-frmt=" to suit pulseview/gtkwave
+    if gnuplot not installed.
+  - Digital VCD: every signal given a value at first sample (gtkwave
+    showed unchanged signals as undefined); standard "1 <unit>" timescale
+    if "viewer-vcd=gtkwave" (its vcd2fst etc. read "125 ns" as "1 ns").
+  - CSV times to nanosecond resolution, were rounded to 6 digits.
+  Checked with sigrok-cli 0.7.2/libsigrok 0.5.2, pulseview 0.4.2, gtkwave
+  3.3.116, gnuplot 6.0, on captures from the simulated device.
+
+Build and test:
+* build/Makefile no longer requires GCC_ARM_ROOT; debug info independent
+  of build location. Dockerfile and "make firmware" for byte-for-byte
+  reproducible build with the original toolchain.
+* test/: simulated device and end-to-end buck50.py tests; export files
+  through the viewers' own readers; emulated tests of the
+  triggering/sampling assembly. GitHub Actions CI.
+* .github/workflows/release.yml: builds firmware on a self-hosted runner
+  with the pinned toolchain, checks it against the committed binaries,
+  runs tests, publishes a GitHub release with .bin/.hex/.elf, buck50.py,
+  udev rule and SHA256SUMS. tools/selfhosted-runner.sh starts a
+  single-use runner for it.
+* README.md rewritten as a short introduction; the original README is now
+  docs/MANUAL.md. README.html (generated, stale) removed.
+
+
+
 0.9.2 buck50.{cxx,elf}  0.9.6 buck50.py    2021 Feb 12 Fri
 -----------------------------------------------------------
 * Fixed small buck50.py bugs: Missing initialization in upload_digital()

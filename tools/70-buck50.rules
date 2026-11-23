@@ -1,0 +1,22 @@
+# udev rules for buck50 "Blue Pill" devices.
+#
+#   - access for the user logged in at the console, without being in the
+#     "dialout" group
+#   - stable name /dev/buck50-<USB serial number>, also usable as
+#     "buck50.py /dev/buck50-<serial>"
+#   - tell ModemManager not to probe the port: it sends AT commands to
+#     anything that looks like a modem
+#
+# The buck50 firmware uses ST's generic "STM32 Virtual COM Port" USB ids,
+# so these rules also match other devices which use them.
+#
+# Install:
+#   sudo cp tools/70-buck50.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+# then unplug and replug the board.
+
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", \
+  ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", \
+  ATTRS{product}=="STM32 Virtual COM Port", \
+  ENV{ID_MM_DEVICE_IGNORE}="1", TAG+="uaccess", \
+  SYMLINK+="buck50-$attr{serial}"

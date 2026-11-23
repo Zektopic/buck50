@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: buck50.py (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    # official Python images: setup-python no longer provides 3.9 on
+    # current runners
+    container: python:${{ matrix.python }}-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.12', '3.13', '3.15']
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install pytest
+      - run: python -m pytest test/test_host.py test/test_scripting.py -v
+
+  viewers:
+    name: export formats (sigrok, GTKWave, gnuplot)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sigrok-cli gtkwave gnuplot-nox
+      - run: pip install pytest
+      - name: Viewer tests (fail, not skip, if a viewer is missing)
+        run: |
+          python -m pytest test/test_viewers.py -v -rs | tee viewers.log
+          ! grep -q SKIPPED viewers.log
+
+  firmware:
+    name: firmware (reproducible build, emulated capture tests)
+    runs-on: ubuntu-latest
+    env:
+      GCC_ARM_URL: https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu-rm/9-2020q2/gcc-arm-none-eabi-9-2020-q2-update-x86_64-linux.tar.bz2
+      GCC_ARM_SHA256: 5adc2ee03904571c2de79d5cfc0f7fe2a5c5f54f44da5b645c17ee57b217f11f
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r test/requirements.txt
+
+      - name: Test the committed firmware image
+        run: python -m pytest test/test_firmware.py -v
+
+      - name: Cache toolchain
+        id: toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/gcc-arm-none-eabi
+          key: gcc-arm-none-eabi-${{ env.GCC_ARM_SHA256 }}
+      - name: Download toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/gcc-arm.tar.bz2" "$GCC_ARM_URL"
+          echo "$GCC_ARM_SHA256  $RUNNER_TEMP/gcc-arm.tar.bz2" | sha256sum -c -
+          mkdir -p ~/gcc-arm-none-eabi
+          tar -xjf "$RUNNER_TEMP/gcc-arm.tar.bz2" -C ~/gcc-arm-none-eabi --strip-components=1
+
+      - name: Rebuild from source
+        run: make -C build clean all GCC_ARM_ROOT="$HOME/gcc-arm-none-eabi"
+      - name: Committed binaries must match the source
+        run: git diff --exit-code --stat -- build/buck50.bin build/buck50.hex build/buck50.elf build/buck50.elf.map
